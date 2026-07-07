@@ -59,7 +59,7 @@ async function runQuery(sql) {
 //   • Staffing: agent_impl_role / agent_impl_manager / agent_impl_shift
 //   • CSAT: FACT_CSAT_RESPONSE_VW WHERE survey_channel = 'csm_booked', AVG(TRY_TO_DOUBLE(raw_value))
 
-const PAGE_SIZE = 500;
+const PAGE_SIZE = 300; // MCP truncates payload above ~471 rows with 16 columns — 300 keeps us safely under
 
 function makePageSQL(offset) {
   return `
@@ -82,14 +82,16 @@ SELECT
   agent_impl_shift              AS SHIFT
 FROM RPT_CUSTOMER_SUCCESS_METRICS_VW
 WHERE agent_impl_role IN ('CSM I', 'CSM II', 'Frontline')
+  AND ticket_type LIKE '[CSM]:%'
   AND created_at_central IS NOT NULL
-ORDER BY created_at_central ASC
+ORDER BY ticket_id ASC
 LIMIT ${PAGE_SIZE} OFFSET ${offset}
 `;
 }
 
 let cachedData = null, cachedCsat = null, cacheTime = 0;
-let csatByTicket = {}; // module-level: ticketId -> scorePct (0-100), available after first load
+let csatByTicket = {};
+let c360ByEmail = {}; // agentEmail -> { total, active }
 const CACHE_TTL = 10 * 60 * 1000;
 
 async function getCsatData() {
@@ -121,21 +123,83 @@ LIMIT 10000
   }
 }
 
+async function getResolvedData() {
+  // Fetch completion dates from TICKET_HISTORY_VW for all CSM tickets
+  // STATS_RESOLVED_AT is epoch seconds with timezone offset suffix e.g. "1777583815.000000000 1440"
+  const sql = `
+SELECT
+  CAST(h.ID AS VARCHAR)                                          AS TICKET_ID,
+  DATE_TRUNC('day',  CONVERT_TIMEZONE('America/Chicago', TO_TIMESTAMP_TZ(SPLIT_PART(h.STATS_RESOLVED_AT::VARCHAR,' ',1)::NUMBER))) AS RESOLVED_DAY,
+  DATE_TRUNC('week', CONVERT_TIMEZONE('America/Chicago', TO_TIMESTAMP_TZ(SPLIT_PART(h.STATS_RESOLVED_AT::VARCHAR,' ',1)::NUMBER))) AS RESOLVED_WEEK,
+  DATE_TRUNC('month',CONVERT_TIMEZONE('America/Chicago', TO_TIMESTAMP_TZ(SPLIT_PART(h.STATS_RESOLVED_AT::VARCHAR,' ',1)::NUMBER))) AS RESOLVED_MONTH
+FROM TICKET_HISTORY_VW h
+JOIN RPT_CUSTOMER_SUCCESS_METRICS_VW m ON CAST(h.ID AS VARCHAR) = CAST(m.TICKET_ID AS VARCHAR)
+WHERE h.STATS_RESOLVED_AT IS NOT NULL
+  AND m.CALL_STATUS = 'Complete'
+  AND m.AGENT_NAME IS NOT NULL
+LIMIT 50000
+`;
+  try {
+    const result = await runQuery(sql);
+    console.log(`Resolved dates fetched: ${(result.rows||[]).length} rows`);
+    return result.rows || [];
+  } catch (e) {
+    console.warn("Resolved data fetch failed:", e.message);
+    return [];
+  }
+}
+
+async function getC360Data() {
+  // Emails are redacted by MCP — use ASSIGNED_CSM (name) as join key instead
+  // Aggregate in Snowflake to avoid pagination of 11k rows
+  const sql = `
+SELECT
+  TRIM(ASSIGNED_CSM)                                           AS CSM_NAME,
+  COUNT(*)                                                     AS TOTAL_CUSTOMERS,
+  SUM(CASE WHEN CUSTOMER_STATUS = 'Active' THEN 1 ELSE 0 END) AS ACTIVE_CUSTOMERS
+FROM RPT_CUSTOMER_360_VW
+WHERE ASSIGNED_CSM IS NOT NULL
+  AND TRIM(ASSIGNED_CSM) != ''
+GROUP BY TRIM(ASSIGNED_CSM)
+ORDER BY TRIM(ASSIGNED_CSM)
+LIMIT 500
+`;
+  try {
+    const result = await runQuery(sql);
+    const rows = result.rows || [];
+    console.log(`C360 aggregated rows: ${rows.length} CSMs`);
+    return rows;
+  } catch (e) {
+    console.warn("C360 fetch failed:", e.message);
+    return [];
+  }
+}
+
 async function getData(force = false) {
   if (!force && cachedData && Date.now() - cacheTime < CACHE_TTL) return cachedData;
   console.log("Fetching all pages from MCP (new view: RPT_CUSTOMER_SUCCESS_METRICS_VW)…");
   let allRows = [];
   let offset = 0;
-  const MAX_PAGES = 100; // 100 × 500 = 50k rows, covers all ~37k CSM tickets
+  const MAX_PAGES = 200; // 200 × 300 = 60k rows, covers all CSM tickets with PAGE_SIZE=300
   while (offset < MAX_PAGES * PAGE_SIZE) {
     const result = await runQuery(makePageSQL(offset));
     const rows = result.rows || [];
-    const declared = result.rowCount || 0;
-    console.log(`  Page offset=${offset}: declared=${declared} got=${rows.length}`);
+    console.log(`  Page offset=${offset}: got=${rows.length}`);
     allRows = allRows.concat(rows);
-    if (declared < PAGE_SIZE) break;
+    if (rows.length < PAGE_SIZE) break;
     offset += PAGE_SIZE;
   }
+  // Deduplicate by ticket_id — stable ORDER BY ticket_id prevents most duplicates
+  // but this is a safety net in case MCP page boundaries shifted mid-fetch
+  const seenIds = new Set();
+  allRows = allRows.filter(r => {
+    const id = String(r.ID);
+    if (seenIds.has(id)) return false;
+    seenIds.add(id);
+    return true;
+  });
+  console.log(`After dedup: ${allRows.length} unique tickets`);
+
   // created_at_central may come back as epoch seconds or YYYY-MM-DD string — handle both
   // created_week_central comes back as YYYY-MM-DD string already
   allRows.forEach(r => {
@@ -154,9 +218,21 @@ async function getData(force = false) {
     // left_zoom_early is BOOLEAN from new view — normalise to JS boolean
     r.LEFT_ZOOM_EARLY = r.LEFT_ZOOM_EARLY === true || String(r.LEFT_ZOOM_EARLY).toLowerCase() === 'true';
   });
-  // Fetch CSAT and attach to rows by ticket_id
-  console.log("Fetching CSAT data…");
-  const csatRows = await getCsatData();
+  // Fetch CSAT + C360 in parallel
+  console.log("Fetching CSAT and C360 data…");
+  const [csatRows, c360Rows] = await Promise.all([getCsatData(), getC360Data()]);
+
+  // Build c360ByEmail keyed by CSM name (emails are MCP-redacted)
+  c360ByEmail = {};
+  c360Rows.forEach(row => {
+    const name = String(row.CSM_NAME || '').trim();
+    if (!name) return;
+    c360ByEmail[name] = {
+      total : parseInt(row.TOTAL_CUSTOMERS  || 0),
+      active: parseInt(row.ACTIVE_CUSTOMERS || 0),
+    };
+  });
+  console.log(`C360 CSMs loaded: ${Object.keys(c360ByEmail).length}`);
   // Build csatByTicket: ticketId -> { scorePct, weekStart, manager }
   // Also build csatByWeek for direct Snowflake-accurate weekly counts
   csatByTicket = {};
@@ -194,7 +270,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const rows = await getData(url.searchParams.get("refresh") === "1");
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ rows, fetchedAt: new Date(cacheTime).toISOString() }));
+      res.end(JSON.stringify({ rows, c360: c360ByEmail, fetchedAt: new Date(cacheTime).toISOString() }));
     } catch (e) {
       console.error(e);
       res.writeHead(500, { "Content-Type": "application/json" });
@@ -414,7 +490,7 @@ tr:hover td{background:#f7fafc}
 const BOOKING_TYPES=new Set(["[CSM]: Branded Mobile App","[CSM]: AI Employee","[CSM]: $497 OB","[CSM]: AAS","[CSM]: Whitelabel Mobile App","[CSM]: Whatsapp","[CSM]: Wordpress","[CSM]: Affiliate","[CSM]: LC Email","[CSM]: ENT","[CSM]: Ads Manager"]);
 const PRODUCT_CALL_TYPES=new Set(["[CSM]: Branded Mobile App","[CSM]: AI Employee","[CSM]: Whitelabel Mobile App","[CSM]: Whatsapp","[CSM]: Wordpress","[CSM]: Affiliate","[CSM]: LC Email","[CSM]: ENT","[CSM]: Ads Manager"]);
 const OB_497_TYPES=new Set(["[CSM]: $497 OB","[CSM]: AAS","[CSM]: Frontline OB","[IMP]: Implementation Call","[IMP]: AAS"]);
-const OOH_TYPES=new Set(["[IMP]: OOH Call","[CSM]: OOH"]);
+const OOH_TYPES=new Set(["[IMP]: OOH Call","[CSM]: OOH","[CSM]: Q&A"]);
 const TOTAL_COMPLETED_BOOKING_TYPES=new Set(["[CSM]: Branded Mobile App","[CSM]: AI Employee","[CSM]: $497 OB","[CSM]: AAS","[CSM]: Whitelabel Mobile App","[CSM]: Whatsapp","[CSM]: Wordpress","[CSM]: Affiliate","[CSM]: LC Email","[CSM]: ENT","[CSM]: Ads Manager","[CSM]: Frontline OB","[IMP]: Implementation Call","[IMP]: AAS"]);
 const COMPLETED_PRODUCT_EXCLUDED=new Set(["[IMP]: OOH Call","[CSM]: OOH","[CSM]: Frontline OB","[IMP]: Implementation Call","[IMP]: AAS","[CSM]: Affiliate","[CSM]: AAS","Customer Success","[CSM]: Ads Manager","[PS] L1 - Frontline","L1 - Frontline","[CSM]: AAS Ticket ID","[CSM]: $497 OB"]);
 const PRODUCT_LINES=[
@@ -429,6 +505,7 @@ const PRODUCT_LINES=[
 ];
 
 let allRows=[];
+let c360Map={}; // agentEmail(lower) -> {total, active} — static, not date-filtered
 
 // ── Relative Date Picker ──────────────────────────────────────────────────────
 // State per prefix: { mode:'last'|'this'|'range', n:8, unit:'Week', from:'', to:'' }
@@ -771,6 +848,22 @@ function getPeriodKey(r,level){
   if(level==='Week'&&r.WEEK_START) return r.WEEK_START;
   return truncDate(getCreatedAt(r),level);
 }
+// Returns the period key based on WHEN the ticket was completed (not created)
+function getResolvedPeriodKey(r,level){
+  const d = level==='Day' ? r.RESOLVED_DAY : level==='Month' ? r.RESOLVED_MONTH : r.RESOLVED_WEEK;
+  return d ? String(d).slice(0,10) : null;
+}
+// Count unique completed ticket IDs grouped by their resolved period
+function countCompletedByPeriod(rows, level){
+  const map={};
+  rows.forEach(r=>{
+    const p=getResolvedPeriodKey(r,level);
+    if(!p) return;
+    if(!map[p]) map[p]=new Set();
+    map[p].add(r.ID);
+  });
+  return map; // period -> Set of ticket IDs
+}
 
 function populateDateOptions(prefix,rows){
   const level=sel(prefix+'-datelevel')||'Week';
@@ -900,6 +993,7 @@ function renderTeamKpis(){
     ['Total No-show',        g=>uniqIds(g,r=>callSt(r)==='No Show')],
     ['Total No-show %',      g=>{const b=uniqIds(g,r=>BOOKING_TYPES.has(r.TYPE));if(!b)return'-';return(uniqIds(g,r=>callSt(r)==='No Show')/b*100).toFixed(2)+'%';}],
     ['No-Status',            g=>uniqIds(g,r=>!callSt(r).trim())],
+    ['Proactive Outreach',   g=>uniqIds(g,r=>r.TYPE==='[CSM]: Proactive Outreach')],
     ['Total Booked CSAT',    g=>uniqIds(g,r=>r.HAS_SURVEY)],
     ['Avg. Booked CSAT',     g=>{const rs=g.filter(r=>r.HAS_CSAT_RESP);if(!rs.length)return'-';return(rs.reduce((s,r)=>s+(r.BOOKED_CSAT||0),0)/rs.length/10).toFixed(1);}],
   ];
@@ -912,7 +1006,7 @@ function renderTeamKpis(){
 
   let html='<table><thead><tr><th>Metric</th>'+periods.map(p=>\`<th>\${fmtDate(p,level)}</th>\`).join('')+'</tr></thead><tbody>';
   const tkStatusByIdx={7:['Rescheduled'],9:['Cancelled'],11:['No Show']};
-  const tkDrillRows=new Set([0,1,2,3,4,5,7,9,11,13,14,16]);
+  const tkDrillRows=new Set([0,1,2,3,4,5,7,9,11,13,14]);
   metrics.forEach(([name],i)=>{
     html+=\`<tr><td style="font-weight:600;background:#f7fafc;white-space:nowrap">\${name}</td>\`+
       periods.map(p=>{
@@ -922,8 +1016,9 @@ function renderTeamKpis(){
         const esc=JSON.stringify([...selMulti('tk-manager')]).replace(/"/g,"'");
         const cesc=JSON.stringify([...selMulti('tk-csm')]).replace(/"/g,"'");
         let extra='';
-        if(tkStatusByIdx[i]) extra=\`,statuses:['\`+tkStatusByIdx[i][0]+\`']\`;
-        else if(i===13)      extra=',noStatus:true';
+        if(tkStatusByIdx[i])  extra=\`,statuses:['\`+tkStatusByIdx[i][0]+\`']\`;
+        else if(i===13)       extra=',noStatus:true';
+        else if(i===14)       extra=\`,types:['[CSM]: Proactive Outreach']\`;
         return \`<td class="drill" onclick="drillToTickets({srcPrefix:'tk',period:'\${p}',periodLevel:'\${level}',mgrList:\${esc},csmList:\${cesc}\${extra}})" title="Open Tickets Info">\${v}</td>\`;
       }).join('')+'</tr>';
   });
@@ -962,7 +1057,7 @@ function renderProductivity(){
     agentMap[key].rows.push(r);
   });
 
-  const COLS=['MANAGER','Agent Name','Date','Shift','# Total Tickets','Total Successful','Total New Bookings','$497 OB Completed','Product Calls','OOH Calls','No-show','No-show %','Rescheduled','Rescheduled %','Cancelled','Cancelled %','No-Status','Total Booked CSAT','Avg. Booked CSAT'];
+  const COLS=['MANAGER','Agent Name','Date','Shift','# Total Tickets','Total Successful','Total New Bookings','$497 OB Completed','Product Calls','OOH Calls','No-show','No-show %','Rescheduled','Rescheduled %','Cancelled','Cancelled %','No-Status','Proactive Outreach','Total Booked CSAT','Avg. Booked CSAT'];
   const tableRows=Object.values(agentMap).sort((a,b)=>(a.mgr+a.agent+a.dl).localeCompare(b.mgr+b.agent+b.dl));
   if(!tableRows.length){document.getElementById('cp-table').innerHTML='<p class="empty-note">No data.</p>';return;}
 
@@ -979,27 +1074,25 @@ function renderProductivity(){
     const grs=uniqIds(g,r=>callSt(r)==='Rescheduled');
     const gca=uniqIds(g,r=>callSt(r)==='Cancelled');
     const gnost=uniqIds(g,r=>!callSt(r).trim());
-    // CSAT
-    const csatRows=g.filter(r=>r.BOOKED_CSAT!=null&&parseFloat(r.BOOKED_CSAT)>0);
-    const totalCsat=new Set(csatRows.map(r=>r.ID)).size;
-    const avgCsat=csatRows.length?(csatRows.reduce((s,r)=>s+parseFloat(r.BOOKED_CSAT),0)/csatRows.length).toFixed(2):'';
-    const gTotalCsat=new Set(g.filter(r=>r.HAS_SURVEY).map(r=>r.ID)).size;  // surveys sent
+    const gpro=uniqIds(g,r=>r.TYPE==='[CSM]: Proactive Outreach');
+    const gTotalCsat=new Set(g.filter(r=>r.HAS_SURVEY).map(r=>r.ID)).size;
     const csatAnswered=g.filter(r=>r.HAS_CSAT_RESP);
     const gAvgCsat=csatAnswered.length>0?(csatAnswered.reduce((s,r)=>s+(r.BOOKED_CSAT||0),0)/csatAnswered.length/10).toFixed(1):'-';
     const vals=[mgr,agent,fmtDate(dl,level),sh,gtt,gsucc,gbk,gob,gcp,gooh,
       gns,gbk?(gns/gbk*100).toFixed(1)+'%':'-',
       grs,gbk?(grs/gbk*100).toFixed(1)+'%':'-',
       gca,gbk?(gca/gbk*100).toFixed(1)+'%':'-',
-      gnost,gTotalCsat,gAvgCsat];
-    // Indices 4+ are ticket counts → make clickable
-    const drillIdxs=new Set([4,5,6,7,8,9,10,12,14,16]);
+      gnost,gpro,gTotalCsat,gAvgCsat];
+    // Indices: 0=Mgr,1=Agent,2=Date,3=Shift,4=TotalTix,5=Succ,6=Bookings,7=OB,8=Prod,9=OOH,10=NoShow,12=Resch,14=Cancel,16=NoStatus,17=Proactive
+    const drillIdxs=new Set([4,5,6,7,8,9,10,12,14,16,17]);
     const statusByIdx={10:['No Show'],12:['Rescheduled'],14:['Cancelled']};
     html+='<tr>'+vals.map((v,idx)=>{
-      const isNum=drillIdxs.has(idx)&&v&&v!=='-'&&v!==0&&v!=='0'&&!String(v).includes('%')&&idx<=16;
+      const isNum=drillIdxs.has(idx)&&v&&v!=='-'&&v!==0&&v!=='0'&&!String(v).includes('%');
       if(!isNum)return \`<td>\${v??''}</td>\`;
       const spec={srcPrefix:'cp',period:dl,periodLevel:level,csm:agent,manager:mgr};
       if(statusByIdx[idx])spec.statuses=statusByIdx[idx];
       if(idx===16)spec.noStatus=true;
+      if(idx===17)spec.types=['[CSM]: Proactive Outreach'];
       return \`<td class="drill" onclick="drillToTickets(\${JSON.stringify(spec).replace(/"/g,\"'\")})" title="Open Tickets Info">\${v}</td>\`;
     }).join('')+'</tr>';
   });
@@ -1270,6 +1363,7 @@ async function loadData(force=false){
     allRows=(json.rows||[]).map(r=>{
       const out={};Object.keys(r).forEach(k=>out[k.toUpperCase()]=r[k]);return out;
     });
+    c360Map=json.c360||{};
     fat.textContent='Fetched at '+new Date(json.fetchedAt).toLocaleTimeString()+' · '+allRows.length+' rows';
     msg.textContent='Loaded '+allRows.length+' rows OK.';
     renderAll();
