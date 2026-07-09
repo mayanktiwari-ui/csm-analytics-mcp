@@ -7,9 +7,9 @@
 const http = require("http");
 const https = require("https");
 
-const MCP_URL = "https://snowflake-mcp-583040996742.us-central1.run.app/mcp";
-const MCP_KEY = "sk-mcp-orch-6c806c200615c5f6222e3738f7e118d4";
-const PORT = 3000;
+const MCP_URL = process.env.MCP_URL || "https://snowflake-mcp-583040996742.us-central1.run.app/mcp";
+const MCP_KEY = process.env.MCP_KEY || "sk-mcp-orch-6c806c200615c5f6222e3738f7e118d4";
+const PORT = parseInt(process.env.PORT || "3000");
 
 function mcpCall(method, params) {
   return new Promise((resolve, reject) => {
